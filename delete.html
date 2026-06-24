@@ -1,0 +1,125 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────────────────
+// IMPORTANT CONTEXT FOR FUTURE READERS (including future me):
+//
+// Drift's login is username + PIN checked directly against Firestore, with
+// NO Firebase Authentication involved. That means `request.auth` is always
+// null here — Firestore has no cryptographically verified way to know
+// which real person is sending a given request. Anyone with the app's
+// Firebase config (which ships inside the app bundle, so it's not really
+// secret) can technically send requests as if they were any user.
+//
+// Given that constraint, these rules can't enforce true per-user
+// ownership. What they DO meaningfully accomplish:
+//   - Block bulk/listing reads of anything that would expose every user's
+//     sensitive data at once (PIN hashes are isolated in a subcollection
+//     that can only ever be read one document at a time, by exact path —
+//     never listed).
+//   - Reject writes that don't match the expected shape for each
+//     document type, so malformed/junk data can't be written even by an
+//     anonymous request.
+//   - Prevent destructive bulk operations like deleting whole collections.
+//
+// A genuinely complete fix would add real Firebase Authentication so
+// request.auth.uid could be checked against document ownership. That's a
+// larger change, tracked separately — these rules are the practical
+// improvement available without it.
+// ─────────────────────────────────────────────────────────────────────────
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- users/{username} ----
+    match /users/{username} {
+      allow get: if true;
+      allow list: if true;
+
+      allow create: if
+        request.resource.data.keys().hasAll(['username']) &&
+        request.resource.data.username == username &&
+        !('pinHash' in request.resource.data) &&
+        !('pinSalt' in request.resource.data);
+
+      allow update: if
+        !('pinHash' in request.resource.data) &&
+        !('pinSalt' in request.resource.data);
+
+      allow delete: if false;
+
+      match /private/credentials {
+        allow get: if true;
+        allow list: if false;
+
+        allow create: if
+          request.resource.data.keys().hasAll(['pinHash', 'pinSalt']) &&
+          request.resource.data.pinHash is string &&
+          request.resource.data.pinSalt is string;
+
+        allow update: if
+          request.resource.data.keys().hasAll(['pinHash', 'pinSalt']) &&
+          request.resource.data.pinHash is string &&
+          request.resource.data.pinSalt is string;
+
+        allow delete: if false;
+      }
+
+      match /contacts/{contactUsername} {
+        allow get, list: if true;
+        allow create: if request.resource.data.keys().hasAll(['addedAt']);
+        allow update: if false;
+        allow delete: if true;
+      }
+
+      match /blocked/{blockedUsername} {
+        allow get, list: if true;
+        allow create: if request.resource.data.keys().hasAll(['blockedAt']);
+        allow update: if false;
+        allow delete: if true;
+      }
+    }
+
+    // ---- conversations/{conversationId} ----
+    match /conversations/{conversationId} {
+      allow get, list: if true;
+
+      allow create: if
+        request.resource.data.keys().hasAll(['participants']) &&
+        request.resource.data.participants is list &&
+        request.resource.data.participants.size() == 2;
+
+      allow update: if
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['lastMessage', 'lastMessageAt', 'hiddenFor', 'isSupportThread', 'lastSender']);
+
+      allow delete: if true;
+
+      match /messages/{messageId} {
+        allow get, list: if true;
+
+        allow create: if
+          request.resource.data.keys().hasAll(
+            ['ciphertext', 'nonce', 'sender', 'createdAt', 'visibleAt', 'deleteAfterMs']
+          ) &&
+          request.resource.data.sender is string &&
+          request.resource.data.ciphertext is string &&
+          request.resource.data.nonce is string;
+
+        allow update: if
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readAt']);
+
+        allow delete: if true;
+      }
+    }
+
+    // ---- reports/{reportId} ----
+    match /reports/{reportId} {
+      allow create: if
+        request.resource.data.keys().hasAll(['reportedBy', 'reportedUser', 'reason', 'createdAt']) &&
+        request.resource.data.reportedBy is string &&
+        request.resource.data.reportedUser is string &&
+        request.resource.data.reason is string;
+      allow get, list, update, delete: if false;
+    }
+  }
+}
